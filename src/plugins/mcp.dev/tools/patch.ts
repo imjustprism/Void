@@ -261,7 +261,7 @@ function diagnoseOrphaned(p: Patch): Record<string, unknown> | null {
 
     const sources = p.all ? ids.map(id => sourceOf(results, id)) : [sourceOf(results, ids[0])];
     const failed = replacements.filter(r => {
-        if (typeof r.replace === "function") return false;
+        if (typeof r.replace === "function" || typeof r.match === "function") return false;
         const regex = compileReplacementMatch(r.match);
         if (!regex) return true;
         return !sources.some(src => {

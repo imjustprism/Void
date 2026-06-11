@@ -206,7 +206,7 @@ function actionCall(args: StoreArgs): unknown {
     const buildResult = (v: unknown): StateObj => {
         const stateAfter = found.store.getState();
         const result: StateObj = { _store: found.resolvedName, result: serialize(v, depth) };
-        const changes = diffState(stateBefore, stateAfter, STORE.SUBSCRIBE_DEPTH, Infinity);
+        const changes = isObject(stateBefore) && isObject(stateAfter) ? diffState(stateBefore, stateAfter, STORE.SUBSCRIBE_DEPTH, Infinity) : [];
         if (changes.length) {
             const changed: Record<string, { from: unknown; to: unknown }> = {};
             for (const { key, from, to } of changes) changed[key] = { from, to };

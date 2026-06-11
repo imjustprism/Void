@@ -20,7 +20,7 @@ export function setCreateElement(fn: CreateElementFn) {
 const LAZY_MAX_RETRIES = 200;
 
 export function LazyComponent<T extends AnyComponent = AnyComponent>(name: string, factory: () => T | null): T {
-    const resolve = makeLazy(factory, LAZY_MAX_RETRIES);
+    const resolve = makeLazy(factory, LAZY_MAX_RETRIES, name);
 
     const wrapper = ((props: Record<string, any>) => {
         const cached = resolve();

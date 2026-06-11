@@ -8,12 +8,15 @@ import { Logger } from "@utils/Logger";
 
 import { INTERCEPT } from "./constants";
 import type { Capture, InterceptArgs, InterceptState } from "./types";
-import { clampConfig, errorMessage, isThenable, requireModuleExports, serialize } from "./utils";
+import { type ActionMap, clampConfig, dispatch, type Errorable, errorMessage, isThenable, requireModuleExports, serialize } from "./utils";
 
 const logger = new Logger("MCP:Intercept");
 
-let nextId = 1;
 const active = new Map<number, InterceptState>();
+let nextId = 1;
+
+const serializeCapture = (value: unknown): unknown => serialize(value, INTERCEPT.SERIALIZE_DEPTH);
+const measureMs = (start: number): number => Math.round((performance.now() - start) * 100) / 100;
 
 function restoreIntercept(state: InterceptState): void {
     try {
@@ -30,7 +33,9 @@ export function clearAllIntercepts(): void {
     active.clear();
 }
 
-function resolveHolder(exports: Record<string, unknown>, exportKey: string): { holder: Record<string, unknown>; finalKey: string } | { error: string } {
+type Holder = { holder: Record<string, unknown>; finalKey: string };
+
+function resolveHolder(exports: Record<string, unknown>, exportKey: string): Holder | { error: string } {
     const parts = exportKey.split(".");
     let holder = exports;
     for (let i = 0; i < parts.length - 1; i++) {
@@ -40,9 +45,6 @@ function resolveHolder(exports: Record<string, unknown>, exportKey: string): { h
     }
     return { holder, finalKey: parts[parts.length - 1] };
 }
-
-const captureArgs = (callArgs: unknown[]): unknown => serialize(callArgs, INTERCEPT.SERIALIZE_DEPTH);
-const measureMs = (start: number) => Math.round((performance.now() - start) * 100) / 100;
 
 function buildWrapper(original: Function, state: InterceptState, maxCaptures: number): Function {
     const wrapper = function (this: unknown, ...callArgs: unknown[]) {
@@ -54,18 +56,18 @@ function buildWrapper(original: Function, state: InterceptState, maxCaptures: nu
             if (!underLimit) return ret;
             const d = measureMs(callStart);
             if (isThenable(ret)) {
-                const capture: Capture = { t: elapsed, d, args: captureArgs(callArgs), ret: "[Promise:pending]" };
+                const capture: Capture = { t: elapsed, d, args: serializeCapture(callArgs), ret: "[Promise:pending]" };
                 state.captures.push(capture);
                 ret.then(
-                    v => { if (active.has(state.id)) capture.ret = serialize(v, INTERCEPT.SERIALIZE_DEPTH); },
+                    v => { if (active.has(state.id)) capture.ret = serializeCapture(v); },
                     e => { if (active.has(state.id)) { capture.ret = null; capture.err = errorMessage(e); } },
                 );
             } else {
-                state.captures.push({ t: elapsed, d, args: captureArgs(callArgs), ret: serialize(ret, INTERCEPT.SERIALIZE_DEPTH) });
+                state.captures.push({ t: elapsed, d, args: serializeCapture(callArgs), ret: serializeCapture(ret) });
             }
             return ret;
-        } catch (err: unknown) {
-            if (underLimit) state.captures.push({ t: elapsed, d: measureMs(callStart), args: captureArgs(callArgs), ret: null, err: errorMessage(err) });
+        } catch (err) {
+            if (underLimit) state.captures.push({ t: elapsed, d: measureMs(callStart), args: serializeCapture(callArgs), ret: null, err: errorMessage(err) });
             throw err;
         }
     };
@@ -78,10 +80,11 @@ function buildWrapper(original: Function, state: InterceptState, maxCaptures: nu
 }
 
 function actionSet(args: InterceptArgs): unknown {
-    const { moduleId, exportKey = "default" } = args;
-    if (moduleId == null) return { error: "Provide moduleId." };
+    const { exportKey = "default" } = args;
+    if (args.moduleId == null) return { error: "Provide moduleId." };
+    const moduleId = Number(args.moduleId);
 
-    const result = requireModuleExports(Number(moduleId));
+    const result = requireModuleExports(moduleId);
     if ("error" in result) return result;
 
     const resolved = resolveHolder(result.exports, exportKey);
@@ -92,18 +95,17 @@ function actionSet(args: InterceptArgs): unknown {
     if (typeof original !== "function") return { error: `${exportKey} is not a function (${typeof original})` };
 
     for (const existing of active.values()) {
-        if (existing.moduleId === Number(moduleId) && existing.exportKey === exportKey) {
+        if (existing.moduleId === moduleId && existing.exportKey === exportKey) {
             return { error: `Intercept already active on module ${moduleId}.${exportKey} (id: ${existing.id}). Stop it first with stop action.` };
         }
     }
 
     const duration = clampConfig(args.duration, { default: INTERCEPT.DEFAULT_DURATION, min: INTERCEPT.MIN_DURATION, max: INTERCEPT.MAX_DURATION });
     const maxCaptures = clampConfig(args.maxCaptures, { default: INTERCEPT.DEFAULT_CAPTURES, min: 1, max: INTERCEPT.MAX_CAPTURES });
-    const id = nextId++;
 
     const state: InterceptState = {
-        id,
-        moduleId: Number(moduleId),
+        id: nextId++,
+        moduleId,
         exportKey,
         finalKey,
         captures: [],
@@ -113,47 +115,48 @@ function actionSet(args: InterceptArgs): unknown {
         timer: setTimeout(() => restoreIntercept(state), duration),
     };
 
-    const wrapper = buildWrapper(original, state, maxCaptures);
     try {
-        Object.defineProperty(holder, finalKey, { value: wrapper, writable: true, configurable: true });
+        Object.defineProperty(holder, finalKey, { value: buildWrapper(original, state, maxCaptures), writable: true, configurable: true });
     } catch {
         clearTimeout(state.timer);
-        return { error: `Cannot intercept non-configurable property "${exportKey}"` };
+        return { error: `Cannot intercept non-configurable property "${exportKey}" (most Turbopack exports are non-configurable getters). Target a configurable nested method (e.g. "default.someMethod"), or use the patch tool to wrap the function at its source.` };
     }
 
-    active.set(id, state);
-    return { id, moduleId: state.moduleId, exportKey, duration, maxCaptures, fnName: original.name ?? null };
+    active.set(state.id, state);
+    return { id: state.id, moduleId, exportKey, duration, maxCaptures, fnName: original.name ?? null };
+}
+
+function requireState(id: number | undefined): Errorable<InterceptState> {
+    if (id == null) return { error: "Provide intercept id." };
+    return active.get(id) ?? { error: `Intercept ${id} not found (expired or stopped)` };
 }
 
 function actionGet(args: InterceptArgs): unknown {
-    const { id } = args;
-    if (id == null) return { error: "Provide intercept id." };
-    const state = active.get(id);
-    if (!state) return { error: `Intercept ${id} not found (expired or stopped)` };
+    const state = requireState(args.id);
+    if ("error" in state) return state;
+    const overflow = state.captures.length > INTERCEPT.GET_CAPTURES_LIMIT;
     return {
         id: state.id,
         moduleId: state.moduleId,
         exportKey: state.exportKey,
         elapsed: Date.now() - state.startTime,
         captures: state.captures.slice(-INTERCEPT.GET_CAPTURES_LIMIT),
-        ...(state.captures.length > INTERCEPT.GET_CAPTURES_LIMIT && { totalCaptures: state.captures.length, hint: `Showing last ${INTERCEPT.GET_CAPTURES_LIMIT} captures. Use stop to get final count.` }),
+        ...(overflow && { totalCaptures: state.captures.length, hint: `Showing last ${INTERCEPT.GET_CAPTURES_LIMIT} captures. Use stop to get final count.` }),
     };
 }
 
 function actionStop(args: InterceptArgs): unknown {
-    const { id } = args;
-    if (id == null) return { error: "Provide intercept id." };
-    const state = active.get(id);
-    if (!state) return { error: `Intercept ${id} not found (expired or stopped)` };
+    const state = requireState(args.id);
+    if ("error" in state) return state;
     const totalCaptures = state.captures.length;
     restoreIntercept(state);
-    return { id, totalCaptures, captures: state.captures.slice(-INTERCEPT.GET_CAPTURES_LIMIT), restored: true };
+    return { id: state.id, totalCaptures, captures: state.captures.slice(-INTERCEPT.GET_CAPTURES_LIMIT), restored: true };
 }
 
 function actionStopAll(): unknown {
-    const count = active.size;
+    const cleared = active.size;
     clearAllIntercepts();
-    return { cleared: count };
+    return { cleared };
 }
 
 function actionList(): unknown {
@@ -166,7 +169,7 @@ function actionList(): unknown {
     }));
 }
 
-const INTERCEPT_ACTIONS: Record<InterceptArgs["action"], (args: InterceptArgs) => unknown> = {
+const INTERCEPT_ACTIONS: ActionMap<InterceptArgs> = {
     set: actionSet,
     get: actionGet,
     stop: actionStop,
@@ -174,8 +177,4 @@ const INTERCEPT_ACTIONS: Record<InterceptArgs["action"], (args: InterceptArgs) =
     list: actionList,
 };
 
-export function handleIntercept(args: InterceptArgs): unknown {
-    const fn = INTERCEPT_ACTIONS[args.action];
-    if (!fn) return { error: `Unknown action: ${args.action}` };
-    return fn(args);
-}
+export const handleIntercept = (args: InterceptArgs): unknown => dispatch(INTERCEPT_ACTIONS, args);

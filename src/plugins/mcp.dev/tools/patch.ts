@@ -12,10 +12,16 @@ import { canonicalizeMatch } from "@utils/patches";
 
 import { PATCH } from "./constants";
 import type { LintWarning, PatchArgs, ValidationIssue } from "./types";
-import { asArray, clampConfig, countCaptureGroups, errorMessage, extractContextAnchors, extractI18nKeys, getAllFactorySources, getFactorySourceCache } from "./utils";
+import { type ActionMap, asArray, clampConfig, countCaptureGroups, dispatch, errorMessage, extractContextAnchors, extractI18nKeys, getAllFactorySources, getFactorySourceCache } from "./utils";
+
+type Patch = (typeof patches)[number];
 
 const CTX_PAD_CFG = { default: PATCH.DEFAULT_CONTEXT_PAD, max: PATCH.MAX_CONTEXT_PAD } as const;
 const ANALYZE_CTX_CFG = { default: PATCH.ANALYZE_DEFAULT_CONTEXT, max: PATCH.MAX_CONTEXT_PAD } as const;
+
+const BACKREF_RE = /\$(\d+)/g;
+
+const backrefs = (replaceStr: string): number[] => [...replaceStr.matchAll(BACKREF_RE)].map(m => Number(m[1]));
 
 function firstIndexOf(src: string, pat: string | RegExp): number {
     if (typeof pat === "string") return src.indexOf(pat);
@@ -23,11 +29,41 @@ function firstIndexOf(src: string, pat: string | RegExp): number {
     return src.search(pat);
 }
 
-function findModulesByFind(findStr: string | string[]): { ids: number[]; results: Record<number, unknown>; canonFind: string | RegExp } {
+interface FindResult {
+    ids: number[];
+    results: Record<number, unknown>;
+    canonFind: string | RegExp;
+}
+
+function findModulesByFind(findStr: string | string[]): FindResult {
     const canonParts = asArray(findStr).map(f => canonicalizeMatch(f));
     const results = search(...canonParts);
-    const ids = Object.keys(results).map(Number);
-    return { ids, results, canonFind: canonParts[0] };
+    return { ids: Object.keys(results).map(Number), results, canonFind: canonParts[0] };
+}
+
+const sourceOf = (results: Record<number, unknown>, id: number): string => String(results[id]);
+
+const isSharedFactory = (ids: number[], results: Record<number, unknown>, src: string): boolean =>
+    ids.every(mid => sourceOf(results, mid) === src);
+
+function compileMatch(matchStr: string, flags?: string): RegExp | { error: string } {
+    try {
+        return canonicalizeMatch(new RegExp(matchStr, flags ?? ""));
+    } catch (e: unknown) {
+        return { error: errorMessage(e) };
+    }
+}
+
+function compileReplacementMatch(match: string | RegExp): RegExp | null {
+    try {
+        return canonicalizeMatch(match instanceof RegExp ? match : new RegExp(match));
+    } catch {
+        return null;
+    }
+}
+
+function nearbyI18n(src: string, at: number, pad: number): Array<{ key: string; default: string }> {
+    return extractI18nKeys(src.slice(Math.max(0, at - pad), Math.min(src.length, at + pad * 2)));
 }
 
 function lintMatchRegex(matchStr: string, replaceStr?: string): LintWarning[] {
@@ -67,7 +103,7 @@ function lintMatchRegex(matchStr: string, replaceStr?: string): LintWarning[] {
         if (groups > 0 && !replaceStr.includes("$&") && !/\$\d/.test(replaceStr)) {
             warnings.push({ severity: "info", message: "Capture groups defined but not referenced in replace", fix: "Use $& or (?:...) for non-capturing" });
         }
-        const refs = replaceStr.match(/\$(\d+)/g)?.map(g => Number(g.slice(1))) ?? [];
+        const refs = backrefs(replaceStr);
         for (const ref of refs) {
             if (ref > groups) warnings.push({ severity: "error", message: `$${ref} referenced but only ${groups} groups` });
         }
@@ -127,13 +163,10 @@ function longestLiteral(matchStr: string): string {
     return best;
 }
 
-function testMatchOnSource(src: string, id: number, findStr: string | string[], matchStr: string, replaceStr: string, flags?: string, contextPad?: number) {
-    let regex: RegExp;
-    try {
-        regex = canonicalizeMatch(new RegExp(matchStr, flags ?? ""));
-    } catch (e: unknown) {
-        return { status: "INVALID_REGEX" as const, error: errorMessage(e) };
-    }
+function testMatchOnSource(src: string, id: number, canonFind: string | RegExp, matchStr: string, replaceStr: string, flags?: string, contextPad?: number): Record<string, unknown> {
+    const compiled = compileMatch(matchStr, flags);
+    if ("error" in compiled) return { status: "INVALID_REGEX", error: compiled.error };
+    const regex = compiled;
 
     const lintWarnings = lintMatchRegex(matchStr, replaceStr);
     const warnings = lintWarnings.filter(w => w.severity === "error" || w.severity === "warn").map(w => w.message);
@@ -147,6 +180,8 @@ function testMatchOnSource(src: string, id: number, findStr: string | string[], 
         return { status: "MATCH_FAILED", id, hint: `Regex error: ${errorMessage(e)}`, ...(warnings.length && { warnings }) };
     }
 
+    const pad = clampConfig(contextPad, CTX_PAD_CFG);
+
     if (!matched) {
         const literal = longestLiteral(matchStr);
         const literalIdx = literal.length >= PATCH.MIN_LITERAL_LENGTH ? src.indexOf(literal) : -1;
@@ -158,25 +193,20 @@ function testMatchOnSource(src: string, id: number, findStr: string | string[], 
         } else {
             hint = "No substantial literal in match pattern — add string anchors";
         }
-        const firstFind = Array.isArray(findStr) ? findStr[0] : findStr;
-        const canonFindStr = canonicalizeMatch(firstFind);
-        const findIdx = firstIndexOf(src, canonFindStr);
-        const nfPad = clampConfig(contextPad, CTX_PAD_CFG);
-        const nearFind = findIdx >= 0 ? src.slice(Math.max(0, findIdx - nfPad), Math.min(src.length, findIdx + nfPad * 2)) : undefined;
+        const findIdx = firstIndexOf(src, canonFind);
+        const nearFind = findIdx >= 0 ? src.slice(Math.max(0, findIdx - pad), Math.min(src.length, findIdx + pad * 2)) : undefined;
         const result: Record<string, unknown> = { status: "MATCH_FAILED", id, len: src.length, hint };
         if (literalIdx >= 0) {
-            const partialStart = Math.max(0, literalIdx - nfPad);
             result.partialAt = literalIdx;
-            result.partialCtx = src.slice(partialStart, Math.min(src.length, literalIdx + literal.length + nfPad));
+            result.partialCtx = src.slice(Math.max(0, literalIdx - pad), Math.min(src.length, literalIdx + literal.length + pad));
         }
         if (nearFind) result.nearFind = nearFind;
         if (warnings.length) result.warnings = warnings;
         return result;
     }
 
-    const replaceGroups = replaceStr.match(/\$(\d+)/g)?.map((g: string) => Number(g.slice(1))) ?? [];
     const captureCount = countCaptureGroups(matchStr);
-    for (const g of replaceGroups) {
+    for (const g of backrefs(replaceStr)) {
         if (g > captureCount) warnings.push(`$${g} referenced but only ${captureCount} groups`);
     }
 
@@ -194,18 +224,14 @@ function testMatchOnSource(src: string, id: number, findStr: string | string[], 
     }
 
     const at = matched.index!;
-    const pad = clampConfig(contextPad, CTX_PAD_CFG);
     const cs = Math.max(0, at - pad);
     const ce = Math.min(src.length, at + matched[0].length + pad);
-
-    const canonFindV = canonicalizeMatch(Array.isArray(findStr) ? findStr[0] : findStr);
-    const findOffset = firstIndexOf(src, canonFindV);
 
     const result: Record<string, unknown> = {
         status: "VALID",
         id,
         at,
-        findOffset,
+        findOffset: firstIndexOf(src, canonFind),
         len: src.length,
         matchLen: matched[0].length,
         matched: matched[0].slice(0, PATCH.MATCH_SLICE),
@@ -213,39 +239,35 @@ function testMatchOnSource(src: string, id: number, findStr: string | string[], 
         after: patchedSrc.slice(cs, Math.max(cs, ce + (patchedSrc.length - src.length))),
     };
     if (/\\[ie]/.test(matchStr)) result.canonicalRegex = regex.source;
-    if (matched.length > 1) result.groups = matched.slice(1).map((g: string) => g?.slice(0, PATCH.GROUP_SLICE));
+    if (matched.length > 1) result.groups = matched.slice(1).map(g => g?.slice(0, PATCH.GROUP_SLICE));
     if (warnings.length) result.warnings = warnings;
     return result;
 }
 
-function diagnoseOrphaned(p: (typeof patches)[number]) {
-    const findParts = asArray(p.find).map(f => String(f));
-    const { ids, results } = findModulesByFind(findParts);
+function diagnoseOrphaned(p: Patch): Record<string, unknown> | null {
+    const { ids, results, canonFind } = findModulesByFind(asArray(p.find).map(String));
     const replacements = asArray(p.replacement);
     const findLabel = String(p.find).slice(0, PATCH.FIND_SLICE);
 
     if (!ids.length) {
         const findStr = String(p.find);
         let inUnloaded = 0;
-        for (const [, src] of getFactorySourceCache()) {
+        for (const src of getFactorySourceCache().values()) {
             if (src.includes(findStr)) inUnloaded++;
         }
         const reason = inUnloaded ? `find matched 0 loaded modules (found in ${inUnloaded} unloaded factory sources — likely lazy chunk)` : "find matched 0 modules";
         return { plugin: p.plugin, find: findLabel, n: replacements.length, reason };
     }
 
-    const sources = p.all ? ids.map(id => String(results[id])) : [String(results[ids[0]])];
+    const sources = p.all ? ids.map(id => sourceOf(results, id)) : [sourceOf(results, ids[0])];
     const failed = replacements.filter(r => {
-        if (typeof r.replace === "function" || typeof r.match === "function") return false;
-        try {
-            const regex = r.match instanceof RegExp ? r.match : canonicalizeMatch(new RegExp(r.match as string));
-            return !sources.some(src => {
-                if (regex instanceof RegExp) regex.lastIndex = 0;
-                return regex.test(src);
-            });
-        } catch {
-            return true;
-        }
+        if (typeof r.replace === "function") return false;
+        const regex = compileReplacementMatch(r.match);
+        if (!regex) return true;
+        return !sources.some(src => {
+            regex.lastIndex = 0;
+            return regex.test(src);
+        });
     });
 
     if (!failed.length) return null;
@@ -256,64 +278,59 @@ function diagnoseOrphaned(p: (typeof patches)[number]) {
             : `find matched ${ids.length} module(s), ${failed.length}/${replacements.length} match regex(es) failed`;
 
     const result: Record<string, unknown> = { plugin: p.plugin, find: findLabel, n: replacements.length, reason, moduleId: ids[0] };
-    const src = String(results[ids[0]]);
-    const canonFind = canonicalizeMatch(findParts[0]);
+    const src = sourceOf(results, ids[0]);
     const findIdx = firstIndexOf(src, canonFind);
     if (findIdx >= 0) {
-        const neighborhood = src.slice(Math.max(0, findIdx - PATCH.ANALYZE_DEFAULT_CONTEXT), Math.min(src.length, findIdx + PATCH.ANALYZE_DEFAULT_CONTEXT * 2));
-        const nearbyI18n = extractI18nKeys(neighborhood);
-        if (nearbyI18n.length) result.nearbyI18n = nearbyI18n;
+        const keys = nearbyI18n(src, findIdx, PATCH.ANALYZE_DEFAULT_CONTEXT);
+        if (keys.length) result.nearbyI18n = keys;
     }
     return result;
 }
 
-const BACKREF_RE = /\$(\d+)/g;
-
-function validatePatch(p: (typeof patches)[number]): ValidationIssue[] {
+function validatePatch(p: Patch): ValidationIssue[] {
     const issues: ValidationIssue[] = [];
-    const findParts = asArray(p.find).map(String);
     const findLabel = String(p.find).slice(0, PATCH.FIND_SLICE);
     const replacements = asArray(p.replacement);
     const push = (issue: Omit<ValidationIssue, "plugin" | "find">): void => {
         issues.push({ plugin: p.plugin, find: findLabel, ...issue });
     };
 
-    const { ids, results } = findModulesByFind(findParts);
+    const { ids, results } = findModulesByFind(asArray(p.find).map(String));
     if (!ids.length) {
         if (!p.noWarn) push({ code: "find::no-module", severity: "error", message: "find matched 0 modules" });
         return issues;
     }
 
-    const uniqueFactories = new Set<string>();
-    for (const id of ids) uniqueFactories.add(String(results[id]));
-    if (!p.all && uniqueFactories.size > 1) {
+    const candidateSources = [...new Set(ids.map(id => sourceOf(results, id)))];
+    if (!p.all && candidateSources.length > 1) {
         push({
             code: "find::ambiguous",
             severity: "error",
-            message: `find matches ${uniqueFactories.size} distinct factories across ${ids.length} modules without all:true`,
+            message: `find matches ${candidateSources.length} distinct factories across ${ids.length} modules without all:true`,
             detail: `ids: ${ids.slice(0, 10).join(", ")}${ids.length > 10 ? "…" : ""}`,
         });
     }
 
-    const candidateSources = [...uniqueFactories];
-    const candidateIds = [...uniqueFactories].map(src => ids.find(id => String(results[id]) === src)!);
+    const candidateIds = candidateSources.map(src => ids.find(id => sourceOf(results, id) === src)!);
     const groupFailures: number[] = [];
 
     for (let r = 0; r < replacements.length; r++) {
         const rep = replacements[r];
-        if (typeof rep.match === "function" || typeof rep.replace === "function") continue;
+        if (typeof rep.replace === "function") continue;
 
         let compiled: RegExp | null = null;
         if (rep.match instanceof RegExp) {
-            try { compiled = canonicalizeMatch(rep.match); }
-            catch (e) {
+            try {
+                compiled = canonicalizeMatch(rep.match);
+            } catch (e) {
                 push({ code: "replace::regex-invalid", severity: "error", message: "match regex failed to compile", replacementIndex: r, detail: errorMessage(e) });
                 groupFailures.push(r);
                 continue;
             }
-        } else if (typeof rep.match === "string") {
-            try { compiled = canonicalizeMatch(new RegExp(rep.match)); }
-            catch {}
+        } else {
+            try {
+                compiled = canonicalizeMatch(new RegExp(rep.match));
+            } catch {}
         }
 
         let hitSrc: string | null = null;
@@ -338,8 +355,7 @@ function validatePatch(p: (typeof patches)[number]): ValidationIssue[] {
 
         if (compiled && typeof rep.replace === "string") {
             const groups = countCaptureGroups(compiled.source);
-            for (const m of rep.replace.matchAll(BACKREF_RE)) {
-                const ref = Number(m[1]);
+            for (const ref of backrefs(rep.replace)) {
                 if (ref > groups) {
                     push({ code: "replace::backref-invalid", severity: "error", message: `replace uses $${ref} but match has only ${groups} capture group(s)`, replacementIndex: r, moduleId: hitModId ?? undefined });
                 }
@@ -350,7 +366,7 @@ function validatePatch(p: (typeof patches)[number]): ValidationIssue[] {
             try {
                 const pluginPath = `Void.plugins[${JSON.stringify(p.plugin)}]`;
                 const replaceExpr = rep.replace.replaceAll("$self", pluginPath);
-                const patched = hitSrc.replace(compiled ?? (rep.match as string), replaceExpr);
+                const patched = hitSrc.replace(compiled ?? rep.match, replaceExpr);
                 new Function("return " + patched.replaceAll(pluginPath, "({})"));
             } catch (e) {
                 push({ code: "replace::syntax-error", severity: "error", message: "replacement produced invalid JavaScript", replacementIndex: r, moduleId: hitModId ?? undefined, detail: errorMessage(e).split("\n")[0] });
@@ -365,7 +381,6 @@ function validatePatch(p: (typeof patches)[number]): ValidationIssue[] {
 
     return issues;
 }
-
 
 function actionList(): unknown {
     return patches.map(p => {
@@ -401,35 +416,31 @@ function actionAnalyze(args: PatchArgs): unknown {
     if (!ids.length) return { unique: false, count: 0, hint: "No modules match this find string" };
 
     const ctxPad = clampConfig(args.context, ANALYZE_CTX_CFG);
+    const sliceCtx = (src: string): string => {
+        const start = Math.max(0, firstIndexOf(src, canonFind) - ctxPad);
+        return src.slice(start, start + ctxPad * 2);
+    };
 
     if (ids.length === 1) {
         const id = ids[0];
-        const src = String(results[id]);
-        const findIdx = firstIndexOf(src, canonFind);
-        const start = Math.max(0, findIdx - ctxPad);
-        const ctx = src.slice(start, start + ctxPad * 2);
-        const nearbyI18n = extractI18nKeys(ctx);
-        const result: Record<string, unknown> = { unique: true, id, at: findIdx, len: src.length, ctx };
-        if (nearbyI18n.length) result.i18nKeys = nearbyI18n;
+        const src = sourceOf(results, id);
+        const ctx = sliceCtx(src);
+        const i18nKeys = extractI18nKeys(ctx);
+        const result: Record<string, unknown> = { unique: true, id, at: firstIndexOf(src, canonFind), len: src.length, ctx };
+        if (i18nKeys.length) result.i18nKeys = i18nKeys;
         return result;
     }
 
-    const firstSrc = String(results[ids[0]]);
-    const sameSource = ids.every(mid => String(results[mid]) === firstSrc);
-
     const entries = ids.slice(0, PATCH.ANALYZE_IDS_LIMIT).map(mid => {
-        const modSrc = String(results[mid]);
-        const modIdx = typeof canonFind === "string" ? modSrc.indexOf(canonFind) : modSrc.search(canonFind);
-        const start = Math.max(0, modIdx - ctxPad);
-        const ctx = modSrc.slice(start, start + ctxPad * 2);
-        const nearbyI18n = extractI18nKeys(ctx);
+        const ctx = sliceCtx(sourceOf(results, mid));
+        const i18nKeys = extractI18nKeys(ctx);
         const entry: Record<string, unknown> = { id: mid, ctx };
-        if (nearbyI18n.length) entry.i18nKeys = nearbyI18n;
+        if (i18nKeys.length) entry.i18nKeys = i18nKeys;
         return entry;
     });
 
     const result: Record<string, unknown> = { unique: false, count: ids.length, entries };
-    if (sameSource) {
+    if (isSharedFactory(ids, results, sourceOf(results, ids[0]))) {
         result.sharedFactory = true;
         result.ids = ids.slice(0, PATCH.ANALYZE_IDS_LIMIT);
         result.hint = `Shared factory, all ${ids.length} IDs share identical source. Use all:true in patch.`;
@@ -441,27 +452,23 @@ function actionTest(args: PatchArgs): unknown {
     const { find: findStr, match: matchStr, replace: replaceStr, flags } = args;
     if (!findStr || !matchStr || !replaceStr) return { error: "Provide find, match, and replace." };
 
-    const { ids, results } = findModulesByFind(findStr);
+    const { ids, results, canonFind } = findModulesByFind(findStr);
     if (!ids.length) {
-        const registry = getRuntimeFactoryRegistry();
-        return { status: "FIND_NO_MATCH", hint: "No modules match this find string. Verify the string exists in module source or use search tool.", factories: registry?.size ?? 0 };
+        return { status: "FIND_NO_MATCH", hint: "No modules match this find string. Verify the string exists in module source or use search tool.", factories: getRuntimeFactoryRegistry()?.size ?? 0 };
     }
 
     const id = ids[0];
-    const src = String(results[id]);
-    const testResult = testMatchOnSource(src, id, findStr, matchStr, replaceStr, flags, args.context);
+    const src = sourceOf(results, id);
+    const testResult = testMatchOnSource(src, id, canonFind, matchStr, replaceStr, flags, args.context);
 
-    if (typeof testResult === "object" && testResult.status === "VALID") {
-        const matchAt = testResult.at as number;
-        const i18nPad = clampConfig(args.context, CTX_PAD_CFG);
-        const neighborhood = src.slice(Math.max(0, matchAt - i18nPad), Math.min(src.length, matchAt + i18nPad * 2));
-        const nearbyI18n = extractI18nKeys(neighborhood);
-        if (nearbyI18n.length) (testResult as Record<string, unknown>).nearbyI18n = nearbyI18n;
+    if (testResult.status === "VALID") {
+        const keys = nearbyI18n(src, testResult.at as number, clampConfig(args.context, CTX_PAD_CFG));
+        if (keys.length) testResult.nearbyI18n = keys;
     }
 
     if (ids.length === 1) return testResult;
 
-    const sameSource = ids.every(mid => String(results[mid]) === src);
+    const sameSource = isSharedFactory(ids, results, src);
     return {
         ...testResult,
         findCount: ids.length,
@@ -492,12 +499,12 @@ function collectResultsByStatus(status: string): Array<{ plugin: string; find: s
 
 function actionBroken(): unknown {
     const report = patchReport();
-    const diagnosed = patches.map(diagnoseOrphaned).filter(Boolean);
+    const orphaned = patches.map(diagnoseOrphaned).filter(Boolean);
     const noEffect = collectResultsByStatus("noEffect");
     const errors = collectResultsByStatus("error");
     const reverted = collectResultsByStatus("reverted");
     return {
-        orphaned: diagnosed,
+        orphaned,
         ...(report.pending.length && { pending: report.pending }),
         ...(noEffect.length && { noEffect }),
         ...(errors.length && { errors }),
@@ -516,9 +523,9 @@ function actionLint(args: PatchArgs): unknown {
     const { match: matchStr, replace: replaceStr } = args;
     if (!matchStr) return { error: "Provide match regex string to lint." };
     const warnings = lintMatchRegex(matchStr, replaceStr);
-    const errorCount = warnings.filter(w => w.severity === "error").length;
-    const warnCount = warnings.filter(w => w.severity === "warn").length;
-    return { warnings, summary: { errors: errorCount, warns: warnCount, info: warnings.length - errorCount - warnCount }, clean: !errorCount && !warnCount };
+    const errors = warnings.filter(w => w.severity === "error").length;
+    const warns = warnings.filter(w => w.severity === "warn").length;
+    return { warnings, summary: { errors, warns, info: warnings.length - errors - warns }, clean: !errors && !warns };
 }
 
 function actionContext(args: PatchArgs): unknown {
@@ -526,12 +533,11 @@ function actionContext(args: PatchArgs): unknown {
     if (!findStr) return { error: "Provide find string." };
     const { ids, results, canonFind } = findModulesByFind(findStr);
     if (!ids.length) {
-        const registry = getRuntimeFactoryRegistry();
-        return { error: "No modules match this find string", hint: "Verify the string exists in module source or use search tool.", factories: registry?.size ?? 0 };
+        return { error: "No modules match this find string", hint: "Verify the string exists in module source or use search tool.", factories: getRuntimeFactoryRegistry()?.size ?? 0 };
     }
 
     const id = ids[0];
-    const src = String(results[id]);
+    const src = sourceOf(results, id);
     const findIdx = firstIndexOf(src, canonFind);
     if (findIdx < 0) return { error: "Find matched module but indexOf failed" };
 
@@ -539,8 +545,7 @@ function actionContext(args: PatchArgs): unknown {
     const windowSize = Math.max(PATCH.CONTEXT_MIN_WINDOW, clampConfig(rawWindow, { default: PATCH.CONTEXT_DEFAULT_WINDOW, max: PATCH.CONTEXT_MAX_WINDOW }));
     const half = Math.floor(windowSize / 2);
     const ctxStart = Math.max(0, findIdx - half);
-    const ctxEnd = Math.min(src.length, findIdx + half);
-    const ctx = src.slice(ctxStart, ctxEnd);
+    const ctx = src.slice(ctxStart, Math.min(src.length, findIdx + half));
 
     const anchors = extractContextAnchors(ctx, getAllFactorySources(), PATCH.CONTEXT_MAX_ANCHORS);
     const findRelative = findIdx - ctxStart;
@@ -550,9 +555,8 @@ function actionContext(args: PatchArgs): unknown {
     const result: Record<string, unknown> = { id, at: findIdx, len: src.length, ctxStart, src: ctx, anchors };
     if (rawWindow != null && rawWindow < PATCH.CONTEXT_MIN_WINDOW) result.note = `Window clamped to minimum of ${PATCH.CONTEXT_MIN_WINDOW} (requested ${rawWindow}).`;
     if (ids.length > 1) {
-        const sameSource = ids.every(mid => String(results[mid]) === src);
         result.findCount = ids.length;
-        if (sameSource) result.sharedFactory = true;
+        if (isSharedFactory(ids, results, src)) result.sharedFactory = true;
     }
     return result;
 }
@@ -568,6 +572,8 @@ interface BenchStats {
     aborted?: true;
 }
 
+const round = (n: number): number => +n.toFixed(3);
+
 function runBench(fn: () => void): BenchStats {
     const phaseStart = performance.now();
     const warmupTimes: number[] = [];
@@ -577,8 +583,8 @@ function runBench(fn: () => void): BenchStats {
         warmupTimes.push(performance.now() - t);
         if (performance.now() - phaseStart > BENCH_PHASE_BUDGET_MS) {
             warmupTimes.sort((a, b) => a - b);
-            const mid = warmupTimes[Math.floor(warmupTimes.length / 2)];
-            return { medianMs: +mid.toFixed(3), p95Ms: +warmupTimes[warmupTimes.length - 1].toFixed(3), maxMs: +warmupTimes[warmupTimes.length - 1].toFixed(3), aborted: true };
+            const max = warmupTimes[warmupTimes.length - 1];
+            return { medianMs: round(warmupTimes[Math.floor(warmupTimes.length / 2)]), p95Ms: round(max), maxMs: round(max), aborted: true };
         }
     }
     const times: number[] = [];
@@ -592,9 +598,9 @@ function runBench(fn: () => void): BenchStats {
     times.sort((a, b) => a - b);
     const aborted = times.length < BENCH_RUNS;
     return {
-        medianMs: +(times[Math.floor(times.length / 2)].toFixed(3)),
-        p95Ms: +(times[Math.floor(times.length * 0.95)].toFixed(3)),
-        maxMs: +(times[times.length - 1].toFixed(3)),
+        medianMs: round(times[Math.floor(times.length / 2)]),
+        p95Ms: round(times[Math.floor(times.length * 0.95)]),
+        maxMs: round(times[times.length - 1]),
         ...(aborted && { aborted: true }),
     };
 }
@@ -603,15 +609,12 @@ function actionBench(args: PatchArgs): unknown {
     const { find: findStr, match: matchStr, replace: replaceStr, flags } = args;
     if (!matchStr) return { error: "Provide match regex string." };
 
-    let regex: RegExp;
-    try {
-        regex = canonicalizeMatch(new RegExp(matchStr, flags ?? ""));
-    } catch (e: unknown) {
-        return { error: `Invalid regex: ${errorMessage(e)}` };
-    }
+    const compiled = compileMatch(matchStr, flags);
+    if ("error" in compiled) return { error: `Invalid regex: ${compiled.error}` };
+    const regex = compiled;
 
     const allSources = getAllFactorySources();
-    const benchFindStr = Array.isArray(findStr) ? findStr[0] : findStr;
+    const benchFindStr = findStr != null ? asArray(findStr)[0] : undefined;
     const canonFind = benchFindStr ? canonicalizeMatch(benchFindStr) : undefined;
 
     const find = canonFind && typeof canonFind === "string" ? runBench(() => {
@@ -654,14 +657,14 @@ function actionValidate(args: PatchArgs): unknown {
     const scope = targetPlugin ? patches.filter(p => p.plugin === targetPlugin) : patches;
     if (targetPlugin && !scope.length) return { error: `No patches for plugin "${targetPlugin}".` };
 
-    const issues: ValidationIssue[] = [];
-    for (const p of scope) issues.push(...validatePatch(p));
+    const issues = scope.flatMap(validatePatch);
 
-    const filtered = severityFilter === "all" ? issues : issues.filter(i => i.severity === severityFilter);
     const byCode: Partial<Record<ValidationIssue["code"], number>> = {};
-    for (const i of issues) byCode[i.code] = (byCode[i.code] ?? 0) + 1;
     const byPlugin: Record<string, number> = {};
-    for (const i of issues) byPlugin[i.plugin] = (byPlugin[i.plugin] ?? 0) + 1;
+    for (const i of issues) {
+        byCode[i.code] = (byCode[i.code] ?? 0) + 1;
+        byPlugin[i.plugin] = (byPlugin[i.plugin] ?? 0) + 1;
+    }
 
     return {
         patches: scope.length,
@@ -670,11 +673,11 @@ function actionValidate(args: PatchArgs): unknown {
         warnings: issues.filter(i => i.severity === "warn").length,
         byCode,
         ...(Object.keys(byPlugin).length && { byPlugin }),
-        issues: filtered,
+        issues: severityFilter === "all" ? issues : issues.filter(i => i.severity === severityFilter),
     };
 }
 
-const PATCH_ACTIONS: Record<PatchArgs["action"], (args: PatchArgs) => unknown> = {
+const PATCH_ACTIONS: ActionMap<PatchArgs> = {
     list: actionList,
     analyze: actionAnalyze,
     test: actionTest,
@@ -687,8 +690,4 @@ const PATCH_ACTIONS: Record<PatchArgs["action"], (args: PatchArgs) => unknown> =
     validate: actionValidate,
 };
 
-export function handlePatch(args: PatchArgs): unknown {
-    const fn = PATCH_ACTIONS[args.action];
-    if (!fn) return { error: `Unknown action: ${args.action}` };
-    return fn(args);
-}
+export const handlePatch = (args: PatchArgs): unknown => dispatch(PATCH_ACTIONS, args);

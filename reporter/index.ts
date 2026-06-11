@@ -10,6 +10,7 @@ import { chunkStats, type ChunkMap, loadChunkMap } from "./chunks";
 import { collectAllFinders, collectAllPatches } from "./extract";
 import { summariseFinders, testFinder } from "./finders";
 import { ansi, counter, type Diagnostic, renderDiagnostic } from "./fmt";
+import { analyzeFragility } from "./fragility";
 import { summariseTimings, testPatch } from "./patches";
 
 const GROK_URL = "https://grok.com";
@@ -108,6 +109,15 @@ export async function run(): Promise<void> {
     for (const [kind, v] of Object.entries(summariseFinders(finderEntries).byKind).sort(([a], [b]) => a.localeCompare(b))) {
         const flag = v.failed ? ansi.red(`-${v.failed}`) : ansi.dim("ok");
         console.log(`  ${ansi.dim(kind.padEnd(22))} ${String(v.total).padStart(4)}  ${flag}`);
+    }
+
+    const fragile = patches.flatMap(p => analyzeFragility(p));
+    console.log(ansi.bold("\nFragility"));
+    if (!fragile.length) {
+        console.log(ansi.dim("  no fragile patterns"));
+    } else {
+        console.log(`  ${ansi.yellow(String(fragile.length))} pattern(s) match now but are likely to break on a future Grok build:`);
+        for (const d of fragile) console.log(renderDiagnostic(d, fileCache));
     }
 
     const allDiags = [...patchDiags, ...finderDiags];

@@ -254,6 +254,7 @@ function patchFactory(moduleId: number, factory: ModuleFactory): LazyPatchResult
         const replacements = Array.isArray(patch.replacement) ? patch.replacement : [patch.replacement];
 
         if (patch.validateOnly) {
+            let anyMatched = false;
             for (const replacement of replacements) {
                 if (replacement.predicate && !replacement.predicate()) continue;
                 const { match } = replacement;
@@ -264,11 +265,12 @@ function patchFactory(moduleId: number, factory: ModuleFactory): LazyPatchResult
                 } else {
                     matches = originalCode.includes(match as string);
                 }
-                if (!matches && !patch.noWarn && !replacement.noWarn) {
+                if (matches) anyMatched = true;
+                else if (!patch.noWarn && !replacement.noWarn) {
                     logger.debug(`[validate] ${patch.plugin}: ${String(match)}`);
                 }
             }
-            if (!patch.all) patches.splice(i--, 1);
+            if (!patch.all && anyMatched) patches.splice(i--, 1);
             continue;
         }
 
@@ -348,7 +350,7 @@ function patchFactory(moduleId: number, factory: ModuleFactory): LazyPatchResult
         patchStats.errors += groupErrors;
         if (groupApplied) patchStats.patchedModules.add(moduleId);
 
-        if (!patch.all) patches.splice(i--, 1);
+        if (!patch.all && groupApplied > 0) patches.splice(i--, 1);
     }
 
     if (!patchedBy.size) return null;
@@ -521,12 +523,25 @@ export function reportOrphanedPatches(): void {
         );
 
     if (patchStats.noEffect || patchStats.errors) {
+        const appliedSomewhere = new Set<string>();
+        for (const result of patchResults)
+            for (const rep of result.replacements)
+                if (rep.status === "applied") appliedSomewhere.add(`${result.plugin}|${rep.match}`);
+
+        const seen = new Set<string>();
+        const broken: string[] = [];
         for (const result of patchResults) {
+            if (result.noWarn) continue;
             for (const rep of result.replacements) {
-                if (rep.status === "noEffect" && !result.noWarn) logger.debug(`[no effect] ${result.plugin}: ${rep.match}`);
-                else if (rep.status === "error") logger.debug(`[error] ${result.plugin}: ${rep.match}`);
+                if (rep.status !== "noEffect" && rep.status !== "error") continue;
+                const matchKey = `${result.plugin}|${rep.match}`;
+                if (rep.status === "noEffect" && appliedSomewhere.has(matchKey)) continue;
+                if (seen.has(matchKey + rep.status)) continue;
+                seen.add(matchKey + rep.status);
+                broken.push(`[${rep.status === "error" ? "error" : "no effect"}] ${result.plugin}: ${String(rep.match)}`);
             }
         }
+        if (broken.length) logger.warn(`${broken.length} patch replacement(s) did not apply (renamed or removed in this Grok build?):`, broken);
     }
 
     if (IS_DEV) {

@@ -69,7 +69,7 @@ export function requireModuleExports(id: number): Errorable<{ exports: Record<st
     return { error: `Module ${id} not found.` };
 }
 
-const INTERNAL_FRAME_RE = /handleEval|ws\.onmessage|chrome-extension:\/\/\w+\/Void\.js|<anonymous>:\d+:\d+\)$/;
+const INTERNAL_FRAME_RE = /handleEval|ws\.onmessage|chrome-extension:\/\/\w+\/Void\.js|(?:<anonymous>:\d+:\d+\)$)/;
 
 export function formatError(err: unknown): string {
     if (!(err instanceof Error)) return `Error: ${String(err)}`;

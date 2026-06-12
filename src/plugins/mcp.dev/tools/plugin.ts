@@ -9,7 +9,7 @@ import { mergePluginSettings, Settings } from "@api/Settings";
 import { OptionType, type Plugin } from "@utils/types";
 
 import type { PluginArgs, PluginInfo } from "./types";
-import { notFound } from "./utils";
+import { type ActionMap, dispatch, notFound } from "./utils";
 
 const TYPE_MAP: Partial<Record<number, string>> = {
     [OptionType.BOOLEAN]: "boolean",
@@ -19,12 +19,22 @@ const TYPE_MAP: Partial<Record<number, string>> = {
     [OptionType.BIGINT]: "bigint",
 };
 
-function resolvePlugin(name: string | undefined): { plugin: Plugin; resolvedName: string } | { error: string; similar?: string[] } {
-    if (!name) return { error: "Provide plugin name." };
-    const resolvedName = plugins[name] ? name : Object.keys(plugins).find(n => n.toLowerCase() === name.toLowerCase());
-    if (!resolvedName) return notFound("Plugin", name, Object.keys(plugins));
-    return { plugin: plugins[resolvedName], resolvedName };
+interface Resolved {
+    plugin: Plugin;
+    name: string;
 }
+
+function resolve(name: string | undefined): Resolved | { error: string; similar?: string[] } {
+    if (!name) return { error: "Provide plugin name." };
+    const exact = plugins[name] ? name : Object.keys(plugins).find(n => n.toLowerCase() === name.toLowerCase());
+    if (!exact) return notFound("Plugin", name, Object.keys(plugins));
+    return { plugin: plugins[exact], name: exact };
+}
+
+const withPlugin = (fn: (p: Resolved, args: PluginArgs) => unknown) => (args: PluginArgs): unknown => {
+    const r = resolve(args.name);
+    return "error" in r ? r : fn(r, args);
+};
 
 function actionList(): PluginInfo[] {
     return Object.values(plugins).map((p): PluginInfo => {
@@ -35,81 +45,49 @@ function actionList(): PluginInfo[] {
     });
 }
 
-function setEnabled(plugin: Plugin, resolvedName: string, enabling: boolean): unknown {
+function setEnabled({ plugin, name }: Resolved, enabling: boolean): unknown {
     if (!enabling) {
-        if (plugin.required) return { error: `Cannot disable required plugin: ${resolvedName}` };
-        if (resolvedName === "MCP") return { error: "Cannot disable MCP plugin via MCP, would kill this connection." };
+        if (plugin.required) return { error: `Cannot disable required plugin: ${name}` };
+        if (name === "MCP") return { error: "Cannot disable MCP plugin via MCP, would kill this connection." };
     }
-    const wasInTargetState = enabling === isPluginEnabled(resolvedName);
-    mergePluginSettings(resolvedName, { enabled: enabling });
-    if (!wasInTargetState) (enabling ? startPlugin : stopPlugin)(plugin);
-    const action = enabling ? "enabled" : "disabled";
-    return { ok: true, action, name: resolvedName, ...(wasInTargetState && { noop: true }) };
+    const noop = enabling === isPluginEnabled(name);
+    mergePluginSettings(name, { enabled: enabling });
+    if (!noop) (enabling ? startPlugin : stopPlugin)(plugin);
+    return { ok: true, action: enabling ? "enabled" : "disabled", name, ...(noop && { noop: true }) };
 }
 
-function actionEnable(args: PluginArgs): unknown {
-    const r = resolvePlugin(args.name);
-    if ("error" in r) return r;
-    return setEnabled(r.plugin, r.resolvedName, true);
+function validateSetting(plugin: Plugin, name: string, key: string, value: unknown): { error: string } | null {
+    const def = plugin.settings?.def?.[key];
+    if (!def) {
+        const valid = plugin.settings?.def;
+        return valid && !(key in valid)
+            ? { error: `Unknown setting key "${key}" for ${name}. Valid keys: ${Object.keys(valid).join(", ")}` }
+            : null;
+    }
+    const expectedType = TYPE_MAP[def.type];
+    if (expectedType && typeof value !== expectedType) return { error: `Setting "${key}" expects ${expectedType}, got ${typeof value}.` };
+    if (def.type === OptionType.SELECT && !def.options.some(o => o.value === value))
+        return { error: `Invalid value for "${key}". Valid options: ${def.options.map(o => JSON.stringify(o.value)).join(", ")}` };
+    if (def.type === OptionType.SLIDER && typeof value === "number" && (value < def.min || value > def.max))
+        return { error: `Value ${value} out of range for "${key}" (min: ${def.min}, max: ${def.max}).` };
+    return null;
 }
 
-function actionDisable(args: PluginArgs): unknown {
-    const r = resolvePlugin(args.name);
-    if ("error" in r) return r;
-    return setEnabled(r.plugin, r.resolvedName, false);
-}
-
-function actionToggle(args: PluginArgs): unknown {
-    const r = resolvePlugin(args.name);
-    if ("error" in r) return r;
-    return setEnabled(r.plugin, r.resolvedName, !isPluginEnabled(r.resolvedName));
-}
-
-function actionSettings(args: PluginArgs): unknown {
-    const r = resolvePlugin(args.name);
-    if ("error" in r) return r;
-    return Settings.plugins[r.resolvedName] ?? {};
-}
-
-function actionSetSetting(args: PluginArgs): unknown {
-    const r = resolvePlugin(args.name);
-    if ("error" in r) return r;
-    const { key, value } = args;
+const actionSetSetting = withPlugin(({ plugin, name }, { key, value }) => {
     if (!key) return { error: "Provide setting key. Use settings action to see available keys." };
+    const invalid = validateSetting(plugin, name, key, value);
+    if (invalid) return invalid;
+    mergePluginSettings(name, { [key]: value });
+    return { ok: true, name, key, value };
+});
 
-    const settingsDef = r.plugin.settings?.def;
-    if (settingsDef) {
-        if (!(key in settingsDef)) return { error: `Unknown setting key "${key}" for ${r.resolvedName}. Valid keys: ${Object.keys(settingsDef).join(", ")}` };
-        const def = settingsDef[key];
-        const expectedType = TYPE_MAP[def.type];
-        if (expectedType && typeof value !== expectedType) {
-            return { error: `Setting "${key}" expects ${expectedType}, got ${typeof value}.` };
-        }
-        if (def.type === OptionType.SELECT) {
-            const { options } = def;
-            if (!options.some(o => o.value === value)) {
-                return { error: `Invalid value for "${key}". Valid options: ${options.map(o => JSON.stringify(o.value)).join(", ")}` };
-            }
-        }
-        if (def.type === OptionType.SLIDER && typeof value === "number" && (value < def.min || value > def.max)) {
-            return { error: `Value ${value} out of range for "${key}" (min: ${def.min}, max: ${def.max}).` };
-        }
-    }
-    mergePluginSettings(r.resolvedName, { [key]: value });
-    return { ok: true, name: r.resolvedName, key, value };
-}
-
-const PLUGIN_ACTIONS: Record<PluginArgs["action"], (args: PluginArgs) => unknown> = {
+const PLUGIN_ACTIONS: ActionMap<PluginArgs> = {
     list: actionList,
-    enable: actionEnable,
-    disable: actionDisable,
-    toggle: actionToggle,
-    settings: actionSettings,
+    enable: withPlugin(p => setEnabled(p, true)),
+    disable: withPlugin(p => setEnabled(p, false)),
+    toggle: withPlugin(p => setEnabled(p, !isPluginEnabled(p.name))),
+    settings: withPlugin(({ name }) => Settings.plugins[name] ?? {}),
     setSetting: actionSetSetting,
 };
 
-export function handlePlugin(args: PluginArgs): unknown {
-    const fn = PLUGIN_ACTIONS[args.action];
-    if (!fn) return { error: `Unknown action: ${args.action}` };
-    return fn(args);
-}
+export const handlePlugin = (args: PluginArgs): unknown => dispatch(PLUGIN_ACTIONS, args);

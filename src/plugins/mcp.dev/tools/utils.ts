@@ -16,6 +16,16 @@ export function isThenable(value: unknown): value is PromiseLike<unknown> {
     return value != null && typeof (value as PromiseLike<unknown>).then === "function";
 }
 
+export type Errorable<T> = T | { error: string };
+
+export type ActionMap<A extends { action: string }> = Record<A["action"], (args: A) => unknown>;
+
+export function dispatch<A extends { action: string }>(actions: ActionMap<A>, args: A): unknown {
+    const fn = actions[args.action as A["action"]];
+    if (!fn) return { error: `Unknown action: ${args.action}`, validActions: Object.keys(actions) };
+    return fn(args);
+}
+
 export function createGenerationalCache<T>(rebuild: () => T, getGen: () => number): { get(): T; clear(): void } {
     let cache: T | null = null;
     let gen = -1;
@@ -50,7 +60,7 @@ export function notFound(kind: string, query: string, allNames: Iterable<string>
     return result;
 }
 
-export function requireModuleExports(id: number): { exports: Record<string, unknown> } | { error: string } {
+export function requireModuleExports(id: number): Errorable<{ exports: Record<string, unknown> }> {
     const cache = getModuleCache();
     const exports = cache.get(id);
     if (exports != null) return { exports };
@@ -59,7 +69,7 @@ export function requireModuleExports(id: number): { exports: Record<string, unkn
     return { error: `Module ${id} not found.` };
 }
 
-const INTERNAL_FRAME_RE = /tryEval|evalAsync|handleEval|ws\.onmessage|<anonymous>:\d+:\d+\)$/;
+const INTERNAL_FRAME_RE = /handleEval|ws\.onmessage|chrome-extension:\/\/\w+\/Void\.js|(?:<anonymous>:\d+:\d+\)$)/;
 
 export function formatError(err: unknown): string {
     if (!(err instanceof Error)) return `Error: ${String(err)}`;
@@ -251,11 +261,13 @@ export function getFactorySourceCache(): Map<number, string> {
 }
 
 let allFactorySourcesCache: string[] | null = null;
+let allFactorySourcesGen = -1;
 
 export function getAllFactorySources(): string[] {
     const cache = getFactorySourceCache();
-    if (allFactorySourcesCache && allFactorySourcesCache.length === cache.size) return allFactorySourcesCache;
+    if (allFactorySourcesCache && allFactorySourcesGen === cache.size) return allFactorySourcesCache;
     allFactorySourcesCache = [...new Set(cache.values())];
+    allFactorySourcesGen = cache.size;
     return allFactorySourcesCache;
 }
 
@@ -278,6 +290,7 @@ export function clearFactoryCaches(): void {
     factorySourceCache = null;
     factorySourceCacheGen = 0;
     allFactorySourcesCache = null;
+    allFactorySourcesGen = -1;
     reverseCache = null;
     reverseCacheGeneration = 0;
 }
@@ -419,8 +432,23 @@ function collectRawAnchors(
     return raw;
 }
 
+const RE_CODE_FRAG = /[(){}]/;
+const RE_CSS_TOKEN = /^-?(?:flex|grid|hidden|block|inline|absolute|relative|fixed|sticky|container|w|h|min|max|p[xytblrse]?|m[xytblrse]?|gap|space|text|bg|border|rounded|items|justify|content|self|font|leading|tracking|shadow|opacity|z|overflow|cursor|select|truncate|ring|outline|transition|duration|ease|scale|rotate|translate|aspect|grow|shrink|basis|order|col|row|from|via|to|fill|stroke|backdrop|antialiased|pointer|whitespace|break|uppercase|lowercase|capitalize|underline|line|size|inset|top|bottom|left|right|gradient)(?:-[\w./[\]#%]+)*$/;
+
+function isFragileAnchor(text: string, type: string): boolean {
+    if (type !== "string" && type !== "template") return false;
+    if (RE_CODE_FRAG.test(text)) return true;
+    if (text.includes(" ")) {
+        const tokens = text.split(/\s+/).filter(Boolean);
+        const cssLike = tokens.filter(t => RE_CSS_TOKEN.test(t)).length;
+        if (cssLike >= 2 && cssLike * 2 >= tokens.length) return true;
+    }
+    return false;
+}
+
 export function extractSuggestAnchors(src: string, allSources: string[], maxCandidates: number): SuggestCandidate[] {
-    const raw = collectRawAnchors(src, { minLen: MODULE.SUGGEST_MIN_LEN, propMinLen: 5, includeTemplates: true });
+    const raw = collectRawAnchors(src, { minLen: MODULE.SUGGEST_MIN_LEN, propMinLen: 5, includeTemplates: true })
+        .filter(a => !isFragileAnchor(a.text, a.type));
     const capped = raw.slice(0, maxCandidates * 3);
     const candidates: SuggestCandidate[] = [];
     let uniqueCount = 0;
@@ -439,7 +467,7 @@ export function extractContextAnchors(ctx: string, allSources: string[], maxAnch
     const anchors: Anchor[] = [];
     for (const { text, type, at } of raw) {
         const globalCount = countInSources(allSources, text, 3);
-        anchors.push({ text, type, at, unique: globalCount === 1 });
+        anchors.push({ text, type, at, unique: globalCount === 1, ...(isFragileAnchor(text, type) && { fragile: true }) });
     }
     return sortAnchors(anchors).slice(0, maxAnchors);
 }

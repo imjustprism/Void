@@ -5,11 +5,10 @@
  */
 
 import { EVAL } from "./constants";
-import type { EvalArgs, EvalError, EvalResult } from "./types";
+import type { EvalArgs } from "./types";
 import { formatError, isThenable, serialize } from "./utils";
 
 const STATEMENT_RE = /^(return|throw|break|continue|if|for|while|switch|try|class|function(?!\s*\()|const|let|var)\b/;
-const NON_RETURNABLE_RE = STATEMENT_RE;
 const IIFE_TRIGGER_RE = /^(?:return\s|let\s|const\s|var\s|class\s)/;
 
 function stripTrailingComment(line: string): string {
@@ -35,9 +34,7 @@ function findLastTopLevelSemicolon(src: string): number {
     for (let i = src.length - 1; i >= 0; i--) {
         const ch = src[i];
         if (ch === "\"" || ch === "'" || ch === "`") {
-            for (i--; i >= 0; i--) {
-                if (src[i] === ch && src[i - 1] !== "\\") break;
-            }
+            while (--i >= 0 && !(src[i] === ch && src[i - 1] !== "\\"));
             continue;
         }
         if (ch === ")") depth++;
@@ -48,9 +45,9 @@ function findLastTopLevelSemicolon(src: string): number {
 }
 
 function autoReturn(code: string): string {
-    const trimmedCode = code.replace(/\s+$/, "");
-    const lastNewline = trimmedCode.lastIndexOf("\n");
-    const lastLine = lastNewline === -1 ? trimmedCode.trim() : trimmedCode.slice(lastNewline + 1).trim();
+    const trimmed = code.replace(/\s+$/, "");
+    const lastNewline = trimmed.lastIndexOf("\n");
+    const lastLine = (lastNewline === -1 ? trimmed : trimmed.slice(lastNewline + 1)).trim();
 
     if (!lastLine || /^[)\]},;]+$/.test(lastLine) || lastLine.startsWith("//") || lastLine.startsWith("/*")) return code;
 
@@ -58,73 +55,61 @@ function autoReturn(code: string): string {
     if (!expr) return code;
 
     if (STATEMENT_RE.test(expr)) {
-        const lastSemi = findLastTopLevelSemicolon(trimmedCode);
-        if (lastSemi > -1 && lastSemi < trimmedCode.length - 1) {
-            const afterSemi = stripTrailingComment(trimmedCode.slice(lastSemi + 1)).trim();
-            if (afterSemi && !NON_RETURNABLE_RE.test(afterSemi)) {
-                return `${trimmedCode.slice(0, lastSemi + 1)}\nreturn ${afterSemi};`;
-            }
+        const semi = findLastTopLevelSemicolon(trimmed);
+        if (semi > -1 && semi < trimmed.length - 1) {
+            const tail = stripTrailingComment(trimmed.slice(semi + 1)).trim();
+            if (tail && !STATEMENT_RE.test(tail)) return `${trimmed.slice(0, semi + 1)}\nreturn ${tail};`;
         }
-        return trimmedCode;
+        return trimmed;
     }
 
-    if (lastNewline === -1) return `return ${expr};`;
-    return `${trimmedCode.slice(0, lastNewline)}\nreturn ${expr};`;
+    return lastNewline === -1 ? `return ${expr};` : `${trimmed.slice(0, lastNewline)}\nreturn ${expr};`;
 }
 
-function needsIIFE(code: string): boolean {
-    return IIFE_TRIGGER_RE.test(code.trimStart());
-}
+const wrapIIFE = (code: string): string => `(()=>{${autoReturn(code)}})()`;
 
-function wrapIIFE(code: string): string {
-    return `(()=>{${autoReturn(code)}})()`;
-}
+// eslint-disable-next-line no-eval
+const run = (code: string): unknown => (0, eval)(code);
 
-function tryEval(code: string): EvalResult | EvalError {
-    try { return { ok: true, value: (0, eval)(code) }; }
-    catch (err: unknown) { return { ok: false, error: err }; }
-}
+const resolveThenable = (value: PromiseLike<unknown>): Promise<unknown> =>
+    Promise.resolve(value).then(
+        val => serialize(val, EVAL.SERIALIZE_DEPTH),
+        (err: unknown) => ({ error: formatError(err) }),
+    );
 
-function evalAsync(code: string): Promise<unknown> {
-    return (0, eval)(`(async()=>{${autoReturn(code)}})()`);
-}
-
-function isAsyncSyntaxError(err: unknown, code: string): boolean {
-    if (!(err instanceof SyntaxError)) return false;
-    return err.message.includes("await") || code.includes("await ") || code.includes("import(");
-}
+const isAsyncSyntaxError = (err: unknown, code: string): boolean =>
+    err instanceof SyntaxError && (err.message.includes("await") || code.includes("await ") || code.includes("import("));
 
 export function handleEval(args: EvalArgs): unknown {
     const { code } = args;
     if (!code) return { error: "Provide code to evaluate." };
-    if (code.length > EVAL.MAX_CODE_LENGTH) return { error: `Code too long: ${code.length} chars (max ${EVAL.MAX_CODE_LENGTH}). Reduce code or split into multiple calls.` };
+    if (code.length > EVAL.MAX_CODE_LENGTH)
+        return { error: `Code too long: ${code.length} chars (max ${EVAL.MAX_CODE_LENGTH}). Reduce code or split into multiple calls.` };
 
-    let evalCode = needsIIFE(code) ? wrapIIFE(code) : code;
-    let r = tryEval(evalCode);
+    const needsIIFE = IIFE_TRIGGER_RE.test(code.trimStart());
+    let source = needsIIFE ? wrapIIFE(code) : code;
 
-    if (!r.ok && isAsyncSyntaxError(r.error, code)) {
-        try {
-            return evalAsync(code).then(
-                val => serialize(val, EVAL.SERIALIZE_DEPTH),
-                (err: unknown) => ({ error: formatError(err) }),
-            );
-        } catch (asyncErr: unknown) {
-            return { error: formatError(asyncErr) };
+    let value: unknown;
+    try {
+        value = run(source);
+    } catch (err) {
+        if (isAsyncSyntaxError(err, code)) {
+            try {
+                return resolveThenable(run(`(async()=>{${autoReturn(code)}})()`) as PromiseLike<unknown>);
+            } catch (asyncErr) {
+                return { error: formatError(asyncErr) };
+            }
+        }
+        if (err instanceof SyntaxError && source === code) {
+            try {
+                value = run((source = wrapIIFE(code)));
+            } catch (retryErr) {
+                return { error: formatError(retryErr) };
+            }
+        } else {
+            return { error: formatError(err) };
         }
     }
 
-    if (!r.ok && r.error instanceof SyntaxError && evalCode === code) {
-        evalCode = wrapIIFE(code);
-        r = tryEval(evalCode);
-    }
-
-    if (!r.ok) return { error: formatError(r.error) };
-
-    if (isThenable(r.value)) {
-        return r.value.then(
-            val => serialize(val, EVAL.SERIALIZE_DEPTH),
-            (err: unknown) => ({ error: formatError(err) }),
-        );
-    }
-    return serialize(r.value, EVAL.SERIALIZE_DEPTH);
+    return isThenable(value) ? resolveThenable(value) : serialize(value, EVAL.SERIALIZE_DEPTH);
 }

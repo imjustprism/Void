@@ -10,7 +10,7 @@ import type { ServerWebSocket } from "bun";
 
 import pkg from "../../../package.json";
 import { MCP } from "./tools/constants";
-import { TOOL_DEFINITIONS } from "./tools/definitions";
+import { TOOL_DEFINITIONS } from "./tools/contract";
 
 const logger = new Logger("MCP", "#ca9ee6");
 const { SLOW_THRESHOLD, REQUEST_TIMEOUT, WS_OPEN } = MCP;

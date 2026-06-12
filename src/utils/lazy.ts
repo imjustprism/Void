@@ -60,7 +60,7 @@ handler.get = (target, p, receiver) => {
 
 const MAX_RETRIES = 50;
 
-export function makeLazy<T>(factory: () => T, maxRetries = MAX_RETRIES): () => T {
+export function makeLazy<T>(factory: () => T, maxRetries = MAX_RETRIES, label?: string): () => T {
     let cache: T;
     let resolved = false;
     let attempts = 0;
@@ -69,7 +69,7 @@ export function makeLazy<T>(factory: () => T, maxRetries = MAX_RETRIES): () => T
             if (attempts >= maxRetries) {
                 if (IS_DEV && attempts === maxRetries) {
                     attempts++;
-                    logger.warn("proxyLazy: factory failed to resolve after", maxRetries, "attempts");
+                    logger.warn(`${label ?? "lazy value"} could not be resolved after ${maxRetries} attempts — likely renamed or removed in this Grok build.`);
                 }
                 return cache;
             }
@@ -81,8 +81,8 @@ export function makeLazy<T>(factory: () => T, maxRetries = MAX_RETRIES): () => T
     };
 }
 
-export function proxyLazy<T>(factory: () => T): T {
-    const getter = makeLazy(factory);
+export function proxyLazy<T>(factory: () => T, label?: string): T {
+    const getter = makeLazy(factory, MAX_RETRIES, label);
     const proxyDummy = Object.assign(() => {}, {
         [SYM_LAZY_CACHED]: void 0 as T | undefined,
         [SYM_LAZY_GET]() {

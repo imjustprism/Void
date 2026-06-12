@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { TOOL_DEFINITIONS } from "./definitions";
+import { TOOL_DEFINITIONS } from "./contract";
 import { handleEval } from "./evaluate";
 import { handleGrok } from "./grok";
 import { handleIntercept } from "./intercept";

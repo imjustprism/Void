@@ -21,7 +21,6 @@ import {
     DropdownMenuSubTrigger,
 } from "@turbopack/common/components";
 import { createElement, React } from "@turbopack/common/react";
-import { setSettingsPrimitive, type SettingsPrimitives } from "@turbopack/common/settingsPrimitives";
 import { SettingsDialogStore } from "@turbopack/common/stores";
 import { findExportedComponentLazy } from "@turbopack/turbopack";
 import { Devs } from "@utils/constants";
@@ -167,11 +166,6 @@ export default definePlugin({
 
     _renderVoidMenu: () => createElement(WrappedVoidMenu),
 
-    _setPrimitive<K extends keyof SettingsPrimitives>(name: K, component: SettingsPrimitives[K]) {
-        setSettingsPrimitive(name, component);
-        return component;
-    },
-
     _tabEntries() {
         return getVisibleTabs().map(t => ({
             id: t.id,
@@ -179,6 +173,7 @@ export default definePlugin({
             i18nKey: t.name,
             defaultLabel: t.name,
             visible: () => true,
+            group: "other",
             component: t.component,
         }));
     },
@@ -200,11 +195,10 @@ export default definePlugin({
 
     patches: [
         {
-            find: "avatar_menu_click",
-            all: true,
+            find: ["avatar_menu_click", '"user-dropdown.settings"'],
             replacement: {
-                match: /\(0,(\i)\.jsxs\)\((\i)\.DropdownMenuSub,\{children:\[\(0,\1\.jsxs\)\(\2\.DropdownMenuSubTrigger,\{children:\[.{0,100}"user-dropdown\.help"/,
-                replace: "$self._renderVoidMenu(),$&",
+                match: /\(0,(\i)\.jsxs\)\((\i)\.DropdownMenuItem,\{onSelect:\i,children:\[\(0,\1\.jsx\)\(\i\.CogIcon,\{className:"size-4 me-2 text-fg-secondary"\}\),\i\("user-dropdown\.settings","Settings"\)\]\}\)/,
+                replace: "[$&,$self._renderVoidMenu()]",
             },
         },
         {
@@ -213,28 +207,6 @@ export default definePlugin({
                 {
                     match: /\i\.filter\(\i=>\i\.visible\(\i\)\)/,
                     replace: "[...$&,...$self._tabEntries()]",
-                },
-                {
-                    match: /children:(\i\.map\(\i=>\(0,\i\.jsx\)\(\i,\{enterprise:\i\.enterprise,children:.{0,160}?\},\i\.id\)\))\}\)/,
-                    replace: "children:[...$1,$self._renderVersion()]})",
-                },
-            ],
-        },
-        {
-            find: '"SettingsTitle",0,',
-            all: true,
-            replacement: [
-                {
-                    match: /("SettingsTitle",0,)(\i)/,
-                    replace: '$1$self._setPrimitive("SettingsTitle",$2)',
-                },
-                {
-                    match: /("SettingsDescription",0,)(\i)/,
-                    replace: '$1$self._setPrimitive("SettingsDescription",$2)',
-                },
-                {
-                    match: /("SettingsRow",0,)(function\(\i\)\{[\s\S]*?\})(,"SettingsSection")/,
-                    replace: '$1$self._setPrimitive("SettingsRow",$2)$3',
                 },
             ],
         },
